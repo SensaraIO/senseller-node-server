@@ -1,6 +1,7 @@
 import mongoose, { Schema } from 'mongoose'
 
 const MessageSchema = new Schema({
+  teamId: { type: Schema.Types.ObjectId, ref: 'Team', index: true, required: true },
   clientId: { type: Schema.Types.ObjectId, ref: 'Client', index: true, required: true },
   direction: { type: String, enum: ['outbound', 'inbound'], required: true },
   from: String,

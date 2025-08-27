@@ -10,16 +10,17 @@ import { extractPlain, isOutOfOffice, safeParseHeaders } from '../lib/utils.js'
 import { renderEmailHtml, renderEmailText, sanitizeAIOutput } from '../lib/email.js'
 import { meetingPrefill } from '../lib/meeting.js'
 import { buildMessageId } from '../lib/utils.js'
+import { requireAuth, requireTeam } from '../middleware/auth.js'
 
 const r = Router()
 const upload = multer({ storage: multer.memoryStorage() })
 
 // Manual send endpoint (parity with /api/email/send)
-r.post('/send', async (req, res) => {
+r.post('/send', requireAuth, requireTeam, async (req, res) => {
   await dbConnect()
   const { clientId, subject, text, html, inReplyTo } = req.body || {}
-  const client = await Client.findById(clientId)
-  const agent = await Agent.findOne()
+  const client = await Client.findOne({ _id: clientId, teamId: req.team.id })
+  const agent = await Agent.findOne({ teamId: req.team.id })
   if (!client || !agent) return res.status(400).json({ error: 'missing client/agent' })
 
   const prefilledUrl = meetingPrefill(agent.meetingUrl, client.name, client.email)
@@ -38,6 +39,7 @@ r.post('/send', async (req, res) => {
   })
 
   await Message.create({
+    teamId: req.team.id,
     clientId: client._id,
     direction: 'outbound',
     from: agent.fromEmail,
@@ -75,14 +77,20 @@ r.post('/inbound', upload.any(), async (req, res) => {
 
   console.log('INBOUND EMAIL:', { from, to, subject, inReplyTo, messageId, textPreview: text?.substring(0, 200) })
 
+  // Determine which team this inbound belongs to by recipient domain or agent.fromEmail
+  const toEmail = (to.match(/<([^>]+)>/)?.[1] || to).trim().toLowerCase()
+  const agent = await Agent.findOne({ fromEmail: toEmail }) || await Agent.findOne({ fromEmail: new RegExp('@' + toEmail.split('@')[1] + '$', 'i') })
+  if (!agent) { console.warn('[inbound] No agent matched for recipient', toEmail); return res.send('ok') }
+  const teamId = agent.teamId
+
   const fromEmail = (from.match(/<([^>]+)>/)?.[1] || from).trim().toLowerCase()
-  let client = await Client.findOne({ email: fromEmail })
+  let client = await Client.findOne({ teamId, email: fromEmail })
   if (!client) {
     console.warn('[inbound] No client found for', fromEmail)
     // OPTIONAL: auto-create client so threads never die on lookup mismatches
     if (process.env.AUTO_CREATE_CLIENTS === '1') {
       const guessedName = (from.match(/^([^<]+)/)?.[1] || '').trim().replace(/["']/g,'') || fromEmail.split('@')[0]
-      client = await Client.create({ name: guessedName || 'Unknown', email: fromEmail, status: 'REPLIED' })
+      client = await Client.create({ teamId, name: guessedName || 'Unknown', email: fromEmail, status: 'REPLIED' })
       console.log('[inbound] Auto-created client', client._id.toString(), client.email)
     } else {
       return res.send('ok') // keep current behavior
@@ -92,6 +100,7 @@ r.post('/inbound', upload.any(), async (req, res) => {
   const plain = extractPlain(text, html)
 
   await Message.create({
+    teamId,
     clientId: client._id,
     direction: 'inbound',
     from: fromEmail,
@@ -113,7 +122,7 @@ r.post('/inbound', upload.any(), async (req, res) => {
   const historyDocs = await Message.find({ clientId: client._id }).sort({ createdAt: 1 }).limit(30).lean()
   const history = historyDocs.map((m) => ({ role: m.direction === 'outbound' ? 'assistant' : 'user', content: m.text || '' }))
 
-  const agent = await Agent.findOne()
+  // Agent already resolved above, just check if it exists
   if (!agent) { console.warn('[inbound] No agent configured'); return res.send('ok') }
 
   const reply = await composeReply({ agent, client, history })
@@ -137,6 +146,7 @@ r.post('/inbound', upload.any(), async (req, res) => {
   console.log('[inbound] SendGrid message id:', providerMessageId || '(none)')
 
   await Message.create({
+    teamId,
     clientId: client._id,
     direction: 'outbound',
     from: agent.fromEmail,

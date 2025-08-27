@@ -3,6 +3,7 @@ import Agent from '../models/Agent.js'
 import Client from '../models/Client.js'
 import Message from '../models/Message.js'
 import { dbConnect } from '../lib/db.js'
+import { requireAuth, requireTeam } from '../middleware/auth.js'
 import { composeInitial } from '../lib/ai.js'
 import { meetingPrefill } from '../lib/meeting.js'
 import { sendEmail } from '../lib/sendgrid.js'
@@ -11,12 +12,12 @@ import { renderEmailHtml, renderEmailText } from '../lib/email.js'
 
 const r = Router()
 
-r.post('/send', async (_req, res) => {
+r.post('/send', requireAuth, requireTeam, async (req, res) => {
   await dbConnect()
-  const agent = await Agent.findOne()
+  const agent = await Agent.findOne({ teamId: req.team.id })
   if (!agent) return res.status(400).send('agent not configured')
 
-  const targets = await Client.find({ status: 'NEW' }).limit(500)
+  const targets = await Client.find({ teamId: req.team.id, status: 'NEW' }).limit(500)
   let sent = 0
   for (const client of targets) {
     const { subject, bodyText } = await composeInitial({ agent, client })
@@ -42,6 +43,7 @@ r.post('/send', async (_req, res) => {
       })
 
       await Message.create({
+        teamId: req.team.id,
         clientId: client._id,
         direction: 'outbound',
         from: agent.fromEmail,

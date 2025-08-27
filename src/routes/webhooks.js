@@ -1,6 +1,8 @@
 import { Router } from 'express'
 import { dbConnect } from '../lib/db.js'
 import Client from '../models/Client.js'
+import Agent from '../models/Agent.js'
+import Booking from '../models/Booking.js'
 
 const r = Router()
 
@@ -36,11 +38,25 @@ r.post('/cal', async (req, res) => {
   if (triggerEvent === 'BOOKING_CANCELLED') { status = 'CANCELLED'; metaField = 'cancelledAt' }
   else if (triggerEvent === 'BOOKING_RESCHEDULED') { status = 'RESCHEDULED'; metaField = 'rescheduledAt' }
 
-  const result = await Client.updateOne(
-    { email },
-    { $set: { status, [`meta.${metaField}`]: new Date(), 'meta.lastWebhookPayload': body, 'meta.lastWebhookEvent': triggerEvent } }
-  )
-  console.log('Update result:', result)
+  const client = await Client.findOne({ email })
+  if (client) {
+    await Client.updateOne(
+      { _id: client._id },
+      { $set: { status, [`meta.${metaField}`]: new Date(), 'meta.lastWebhookPayload': body, 'meta.lastWebhookEvent': triggerEvent } }
+    )
+    // Create a booking record
+    await Booking.create({ 
+      teamId: client.teamId, 
+      clientId: client._id, 
+      status, 
+      occurredAt: new Date(), 
+      source: 'cal', 
+      raw: body 
+    })
+    console.log('Update result: client and booking updated')
+  } else {
+    console.log('No client found for email:', email)
+  }
   res.send('ok')
 })
 

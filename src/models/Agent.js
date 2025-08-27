@@ -1,6 +1,7 @@
 import mongoose, { Schema } from 'mongoose'
 
 const AgentSchema = new Schema({
+  teamId: { type: Schema.Types.ObjectId, ref: 'Team', index: true, required: true },
   name: { type: String, default: 'Sales Agent' },
   fromEmail: { type: String, required: true },
   meetingProvider: { type: String, enum: ['calcom', 'calendly', 'other'], default: 'calcom' },
