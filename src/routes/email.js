@@ -18,7 +18,7 @@ const upload = multer({ storage: multer.memoryStorage() })
 // Manual send endpoint (parity with /api/email/send)
 r.post('/send', requireAuth, requireTeam, async (req, res) => {
   await dbConnect()
-  const { clientId, subject, text, html, inReplyTo } = req.body || {}
+  const { clientId, subject, text, inReplyTo } = req.body || {}
   const client = await Client.findOne({ _id: clientId, teamId: req.team.id })
   const agent = await Agent.findOne({ teamId: req.team.id })
   if (!client || !agent) return res.status(400).json({ error: 'missing client/agent' })
@@ -77,23 +77,61 @@ r.post('/inbound', upload.any(), async (req, res) => {
 
   console.log('INBOUND EMAIL:', { from, to, subject, inReplyTo, messageId, textPreview: text?.substring(0, 200) })
 
-  // Determine which team this inbound belongs to by recipient domain or agent.fromEmail
   const toEmail = (to.match(/<([^>]+)>/)?.[1] || to).trim().toLowerCase()
-  const agent = await Agent.findOne({ fromEmail: toEmail }) || await Agent.findOne({ fromEmail: new RegExp('@' + toEmail.split('@')[1] + '$', 'i') })
-  if (!agent) { console.warn('[inbound] No agent matched for recipient', toEmail); return res.send('ok') }
-  const teamId = agent.teamId
+  const toDomain = toEmail.split('@')[1] || ''
+  const rootDomain = toDomain.replace(/^reply\./i, '') // strip "reply." if present
 
   const fromEmail = (from.match(/<([^>]+)>/)?.[1] || from).trim().toLowerCase()
-  let client = await Client.findOne({ teamId, email: fromEmail })
+
+  // 1) Prefer finding the client by sender to establish team scope immediately
+  let client = await Client.findOne({ email: fromEmail })
+  let teamId = client?.teamId
+
+  // 2) If no client yet, try resolve agent by recipient:
+  let agent = null
+  if (!teamId) {
+    // Try exact match on recipient (in case you store a dedicated reply-to on Agent later)
+    agent = await Agent.findOne({ fromEmail: toEmail })
+    if (!agent) {
+      // Try recipient domain, then root domain (strip "reply.")
+      const candidates = await Agent.find({
+        $or: [
+          { fromEmail: new RegExp('@' + toDomain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') },
+          { fromEmail: new RegExp('@' + rootDomain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') },
+        ]
+      }).lean()
+      if (candidates.length) {
+        // Prefer exact domain match if available
+        agent = candidates.find(a => a.fromEmail.toLowerCase().endsWith('@' + toDomain)) || candidates[0]
+      }
+    }
+    if (!agent) {
+      console.warn('[inbound] No agent matched for recipient', toEmail, 'domain:', toDomain, 'root:', rootDomain)
+      return res.send('ok')
+    }
+    teamId = agent.teamId
+  } else {
+    // We have teamId from client; also load agent for that team
+    agent = await Agent.findOne({ teamId })
+    if (!agent) {
+      console.warn('[inbound] Client found but no agent configured for team', teamId)
+      return res.send('ok')
+    }
+  }
+
+  // Now check if client exists with the resolved teamId
   if (!client) {
-    console.warn('[inbound] No client found for', fromEmail)
-    // OPTIONAL: auto-create client so threads never die on lookup mismatches
-    if (process.env.AUTO_CREATE_CLIENTS === '1') {
-      const guessedName = (from.match(/^([^<]+)/)?.[1] || '').trim().replace(/["']/g,'') || fromEmail.split('@')[0]
-      client = await Client.create({ teamId, name: guessedName || 'Unknown', email: fromEmail, status: 'REPLIED' })
-      console.log('[inbound] Auto-created client', client._id.toString(), client.email)
-    } else {
-      return res.send('ok') // keep current behavior
+    client = await Client.findOne({ teamId, email: fromEmail })
+    if (!client) {
+      console.warn('[inbound] No client found for', fromEmail)
+      // OPTIONAL: auto-create client so threads never die on lookup mismatches
+      if (process.env.AUTO_CREATE_CLIENTS === '1') {
+        const guessedName = (from.match(/^([^<]+)/)?.[1] || '').trim().replace(/["']/g,'') || fromEmail.split('@')[0]
+        client = await Client.create({ teamId, name: guessedName || 'Unknown', email: fromEmail, status: 'REPLIED' })
+        console.log('[inbound] Auto-created client', client._id.toString(), client.email)
+      } else {
+        return res.send('ok') // keep current behavior
+      }
     }
   }
 
@@ -119,7 +157,7 @@ r.post('/inbound', upload.any(), async (req, res) => {
   if (client.status === 'STOPPED') return res.send('ok')
   if (isOutOfOffice(plain)) return res.send('ok')
 
-  const historyDocs = await Message.find({ clientId: client._id }).sort({ createdAt: 1 }).limit(30).lean()
+  const historyDocs = await Message.find({ teamId, clientId: client._id }).sort({ createdAt: 1 }).limit(30).lean()
   const history = historyDocs.map((m) => ({ role: m.direction === 'outbound' ? 'assistant' : 'user', content: m.text || '' }))
 
   // Agent already resolved above, just check if it exists
