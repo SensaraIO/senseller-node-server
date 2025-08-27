@@ -73,11 +73,21 @@ r.post('/inbound', upload.any(), async (req, res) => {
   const inReplyTo = String(get('in-reply-to') || get('In-Reply-To') || '')
   const messageId = String(get('Message-Id') || get('message-id') || '')
 
-  console.log('INBOUND EMAIL:', { from, to, subject, text: text?.substring(0, 500) })
+  console.log('INBOUND EMAIL:', { from, to, subject, inReplyTo, messageId, textPreview: text?.substring(0, 200) })
 
   const fromEmail = (from.match(/<([^>]+)>/)?.[1] || from).trim().toLowerCase()
-  const client = await Client.findOne({ email: fromEmail })
-  if (!client) return res.send('ok')
+  let client = await Client.findOne({ email: fromEmail })
+  if (!client) {
+    console.warn('[inbound] No client found for', fromEmail)
+    // OPTIONAL: auto-create client so threads never die on lookup mismatches
+    if (process.env.AUTO_CREATE_CLIENTS === '1') {
+      const guessedName = (from.match(/^([^<]+)/)?.[1] || '').trim().replace(/["']/g,'') || fromEmail.split('@')[0]
+      client = await Client.create({ name: guessedName || 'Unknown', email: fromEmail, status: 'REPLIED' })
+      console.log('[inbound] Auto-created client', client._id.toString(), client.email)
+    } else {
+      return res.send('ok') // keep current behavior
+    }
+  }
 
   const plain = extractPlain(text, html)
 
@@ -93,6 +103,7 @@ r.post('/inbound', upload.any(), async (req, res) => {
     inReplyTo: inReplyTo || undefined,
     rawHeaders: headersRaw ? safeParseHeaders(headersRaw) : undefined,
   })
+  console.log('[inbound] Saved inbound message for client', client._id.toString())
 
   if (['BOOKED','CANCELLED','RESCHEDULED'].includes(client.status)) return res.send('ok')
   if (client.status !== 'STOPPED') await Client.updateOne({ _id: client._id }, { $set: { status: 'REPLIED', lastMessageAt: new Date() } })
@@ -103,9 +114,11 @@ r.post('/inbound', upload.any(), async (req, res) => {
   const history = historyDocs.map((m) => ({ role: m.direction === 'outbound' ? 'assistant' : 'user', content: m.text || '' }))
 
   const agent = await Agent.findOne()
-  if (!agent) return res.send('ok')
+  if (!agent) { console.warn('[inbound] No agent configured'); return res.send('ok') }
 
   const reply = await composeReply({ agent, client, history })
+  console.log('[inbound] AI reply length:', (reply || '').length)
+
   const prefilledUrl = meetingPrefill(agent.meetingUrl, client.name, client.email)
   const signature = agent.useHtmlSignature && agent.signatureHtml
     ? { html: agent.signatureHtml, imageUrl: agent.signatureImageUrl }
@@ -121,6 +134,7 @@ r.post('/inbound', upload.any(), async (req, res) => {
     html: htmlEmail,
     headers: client.lastOutboundMessageId ? { 'In-Reply-To': client.lastOutboundMessageId, 'References': client.lastOutboundMessageId } : {},
   })
+  console.log('[inbound] SendGrid message id:', providerMessageId || '(none)')
 
   await Message.create({
     clientId: client._id,
@@ -132,6 +146,7 @@ r.post('/inbound', upload.any(), async (req, res) => {
     html: htmlEmail,
     providerId: providerMessageId || null,
   })
+  console.log('[inbound] Saved outbound reply for client', client._id.toString())
 
   res.send('ok')
 })
