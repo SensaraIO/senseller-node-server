@@ -15,7 +15,10 @@ r.get('/', async (_req, res) => {
 
 r.post('/', async (req, res) => {
   await dbConnect()
-  const created = await Client.create(req.body)
+  const created = await Client.create({
+    ...req.body,
+    email: String(req.body.email).trim().toLowerCase(),
+  })
   res.json(created)
 })
 
@@ -35,8 +38,8 @@ r.post('/import', upload.single('file'), async (req, res) => {
   let inserted = 0, skipped = 0
   for (const r of records) {
     const name = r.name || r.Name || r.fullname || r.FullName
-    const email = r.email || r.Email || r.eMail
-    if (!name || !email) { skipped++; continue }
+    const email = String(r.email || r.Email || r.eMail || '').trim().toLowerCase()
+        if (!name || !email) { skipped++; continue }
     try {
       await Client.updateOne({ email }, { $setOnInsert: { name, email } }, { upsert: true })
       inserted++
